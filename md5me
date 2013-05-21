@@ -1,0 +1,106 @@
+#!/bin/bash
+# This was sloppily thrown together until it worked. Perhaps someday it will generate reports per server rather than per file.
+# I can only clean up/optimize one script per day. 
+# Today is not this script's day. 
+# Tomorrow doesn't look good, either.
+#
+#ir=ir_`date +%d%b%Y` # report file to read from
+checkpoint="$1"                                                # start at file $1 (helpful if you cancelled a previous run)
+diffmereport=/tmp/md5mediff_mbillings                          # write diffs of backups here
+finalreport=/home/mbillings/reports/md5mereport_`date +%d%b%Y` # write everything to a final report
+md5me_ir=/tmp/md5me_ir_mbillings                               # write checksums here
+report=/home/mbillings/reports/ir_`date +%d%b%Y`               # report file to read
+
+
+# make sure the file exists first
+if [ ! -e $report ]
+then echo "Can't find reports/ir_`date +%d%b%Y`"
+     exit 1
+fi
+
+if [ -e $finalreport ]
+then mv -f $finalreport $finalreport.am
+fi
+
+sshme()
+{
+    sshto=$1
+    # if the file exists and is no larger than 1 GiB
+	ssh -q $sshto "
+	if [ ! -d $filetocheck ]
+	then for j in {0..9}
+		 do  if [ -e /usr/local/backup/daily.\$j/localhost$filetocheck ] && [ \$(du -hs $filetocheck | cut -d\  -f1 | grep -c G) -ne 1 ] && [ \"\$(md5sum $filetocheck | cut -d\  -f1)\" == \"\$(md5sum /usr/local/backup/daily.\$j/localhost$filetocheck | cut -d\  -f1)\" ]
+			 then echo Checksums match on the local file system from the backup \$j days ago. Permission/ownership differences (if any):
+                              diff <(ls -l $filetocheck | awk '{print $1,$4}') <(ls -l /usr/local/backup/daily.\$j | awk '{print $1,$4}')
+			 else if [ -e /usr/local/backup/daily.\$j/localhost$filetocheck ] && [ \$(du -hs $filetocheck | cut -d\  -f1 | grep -c G) -ne 1 ] 
+			      then echo Differences on local file system from the backup \$j days ago. Permissions/ownership differences (if any):
+                                   diff <(ls -l $filetocheck | awk '{print $1,$4}') <(ls -l /usr/local/backup/daily.\$j | awk '{print $1,$4}')
+                                   diff $filetocheck /usr/local/backup/daily.\$j/localhost$filetocheck | grep -E '>|<' | sed s/\>\ //g | sed s/\<\ //g && break
+			      fi
+			 fi
+			 if [ \$j -eq 9 ] && [ \$(du -hs $filetocheck | cut -d\  -f1 | grep -Ec \"G|M\") -ne 1 ] && [ \$(file $filetocheck | grep -c text) -eq 1 ]
+			 then hostname -f && cat $filetocheck 
+			 else hostname -f && echo Non-text or removed
+			 fi
+		 done
+	else echo Directory
+	fi" > $diffmereport #| tee $diffmereport
+}
+
+# remove temporary files in case of messy previous run
+rm $diffmereport{,.compare,.diffs} $md5me_ir $finalreport 2>/dev/null
+
+# for each file
+for filetocheck in $(sed '1,/^$/d' "$report" | grep -v hosting | grep -E ".net|.com" | awk '{print $4}' | sort | uniq)
+do
+	# (optional $1) start from where you left off in a previous run
+	if [ -n "$checkpoint" ] 
+	then if [ "`echo $filetocheck $checkpoint | tr ' ' '\n' | sort | tail -1`" != "$checkpoint" ]
+	     then checkpoint=""
+	     else continue
+	     fi
+	fi
+
+    hosts=""        # reset the hosts
+    hosts_delimited=$(awk '{print $2,$4}' $report | grep -v hosting | grep "$filetocheck"$ | awk '{print $1}' | sort | uniq | tr '\n' ';') 
+
+    # check each host (if multiple) and see what the difference was
+    if [ $(echo $hosts_delimited | tr ';' '\n' | grep -v ^$ | wc -l) -le 1 ]
+    then echo -e $filetocheck " only changed on "$(echo $hosts_delimited | tr ';' '\n' | head -1)":\n" >> $finalreport
+         sshme $(echo $hosts_delimited | tr ';' '\n' | head -1)
+         grep -E "<|>" $diffmereport >> $finalreport
+    else    
+	 echo -e "\n$filetocheck" >> $finalreport &&
+         for hoststocheck in $(echo $hosts_delimited | tr ';' '\n')
+	 do 
+	     echo -e "\n$hoststocheck" >> $finalreport && 
+	     ping -c1 -w1 $hoststocheck 1>/dev/null && 
+	     ssh -q $hoststocheck "test -e $filetocheck && test ! -d $filetocheck && md5sum $filetocheck | cut -f1 -d\  || echo 'DIRECTORY OR DOES NOT EXIST'" | tee -a $md5me_ir >> $finalreport &&
+	     hosts="$hosts $hoststocheck" || 
+	     echo "Cannot ping host!" >> $finalreport
+	 done
+		
+	     #echo -e "\n========= File =========\n$filetocheck"
+	     #echo -e "\n========= MD5s ========="
+	     result=`sort $md5me_ir | uniq | tr '\n' ';'`
+			
+	 if [ `echo $result | tr ';' '\n' | grep -v "^$" | wc -l` -eq 1 ]
+	 then echo Checksums match >> $finalreport
+	 else #echo $result | tr ';' '\n' | grep -v "^$"
+	      for i in $hosts
+	      do  sshme $i #echo -e "\n$i\n" 
+		  if  [ ! -e $diffmereport.compare ]
+		  then cp -f $diffmereport $diffmereport.compare
+		  else diff $diffmereport.compare $diffmereport >> $diffmereport.diffs
+		  fi
+	      done
+	 echo -e "\n\n=====UNIQUES=====\n\n" >> $finalreport
+	 column -t $diffmereport.diffs | grep -E "<|>" | grep -v Checksums | sort | uniq >> $finalreport
+	 #read line
+	 fi
+    fi
+    echo -e "\n\n\n\n\n\n=====================================" >> $finalreport
+    # remove temp files
+    rm $diffmereport{,.compare,.diffs} $md5me_ir 1>/dev/null 2>&1
+done
+
