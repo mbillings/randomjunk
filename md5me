@@ -30,12 +30,12 @@ sshme()
 	if [ ! -d $filetocheck ]
 	then for j in {0..9}
 		 do  if [ -e /usr/local/backup/daily.\$j/localhost$filetocheck ] && [ \$(du -hs $filetocheck | cut -d\  -f1 | grep -c G) -ne 1 ] && [ \"\$(md5sum $filetocheck | cut -d\  -f1)\" == \"\$(md5sum /usr/local/backup/daily.\$j/localhost$filetocheck | cut -d\  -f1)\" ]
-			 then echo Checksums match on the local file system from the backup \$j days ago. Permission/ownership differences (if any):
-                              diff <(ls -l $filetocheck | awk '{print $1,$4}') <(ls -l /usr/local/backup/daily.\$j | awk '{print $1,$4}')
+			 then echo Checksums match on the local file system from the daily.\$j backup. Permission and ownership differences:
+                  diff <(ls -l $filetocheck | awk '{print \$1,\$4}') <(ls -l /usr/local/backup/daily.\$j | awk '{print \$1,\$4}') | grep -v total | sort | uniq
 			 else if [ -e /usr/local/backup/daily.\$j/localhost$filetocheck ] && [ \$(du -hs $filetocheck | cut -d\  -f1 | grep -c G) -ne 1 ] 
-			      then echo Differences on local file system from the backup \$j days ago. Permissions/ownership differences (if any):
-                                   diff <(ls -l $filetocheck | awk '{print $1,$4}') <(ls -l /usr/local/backup/daily.\$j | awk '{print $1,$4}')
-                                   diff $filetocheck /usr/local/backup/daily.\$j/localhost$filetocheck | grep -E '>|<' | sed s/\>\ //g | sed s/\<\ //g && break
+			      then echo Differences on local file system from the daily.\$j backup. Permissions and ownership differences:
+                       diff <(ls -l $filetocheck | awk '{print \$1,\$4}') <(ls -l /usr/local/backup/daily.\$j | awk '{print \$1,\$4}') | grep -v total | sort | uniq
+                       diff $filetocheck /usr/local/backup/daily.\$j/localhost$filetocheck | grep -E '>|<' | sed s/\>\ //g | sed s/\<\ //g && break
 			      fi
 			 fi
 			 if [ \$j -eq 9 ] && [ \$(du -hs $filetocheck | cut -d\  -f1 | grep -Ec \"G|M\") -ne 1 ] && [ \$(file $filetocheck | grep -c text) -eq 1 ]
