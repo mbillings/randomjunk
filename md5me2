@@ -1,0 +1,222 @@
+#!/bin/bash
+# version 2.0!
+#
+# 1. Write pseudocode for archive check and addition - Done
+# 2. Write check for package install condition
+#
+# Pseudocode todo
+# if [ -e file_checksum ]
+# then
+#      if [ -d file_checksum ]
+#      then 
+#           if [ file_checksum == archive_checksum ]           # match checksum to archive
+#           then echo yay! 
+#           else if [ file_checksum == file_checksum_in_repo ] # match checksum in repo
+#                then echo yay!
+#                     echo file_checksum > archived_checksums    # add checksum to archive
+#                else if [ -e /usr/local/backup/<file> ]       
+#                     then diff file /usr/local/backup/<file>  # diff file against backup file
+#                     else if [ file_size < 1MB ]
+#                          then cat file                       # output file 
+#                          else echo CHECK $file ON $host ALSO APPEARS ON $hosts
+#                          fi
+#                     fi
+#                fi
+#           fi
+#      else $file is directory
+#      fi
+# else $file does not exist (removed?)
+# fi
+# 
+#
+#ir=ir_`date +%d%b%Y` # report file to read from
+# list of files to ignore, separate with a "|"
+ignorelist=".rdb"
+archive="/home/mbillings/IR/archive.txt"              # records of files and their corresponding checksums
+backupcheck=0                                         # 1 = check if there are backups, 0 = don't check for backups
+checkpoint="$1"                                       # start at file $1 (helpful if you cancelled a previous run)
+checksum=md5sum                                       # define which checksum to use
+diffmereport=/home/mbillings/IR/tmp/md5mediff         # write diffs of backups here
+finalreport=/home/mbillings/IR/reports/`date +%d%b%Y` # write everything to a final report
+host=                                                 # pull reports from here
+md5me_ir=/home/mbillings/IR/tmp/md5me_ir              # write checksums here
+report=/home/mbillings/IR/records/ir_`date +%d%b%Y`   # report file to read
+reporttmp=/home/mbillings/IR/tmp                      # write server reports to this directory
+
+precheck()
+{
+  # make sure the file exists first
+  if [ ! -e $report ]
+  then echo "Can't find reports/ir_`date +%d%b%Y`"
+       exit 1
+  fi
+
+  # clear out the reporttmp directory before each run
+  if [ -d $reporttmp ]
+  then rm -rf $reporttmp
+  fi
+  mkdir $reporttmp
+
+  # if a report already exists, assume it's the AM report and move it 
+  if [ -e $finalreport ]
+  then if [ ! -e $finalreport.am ]
+       then  mv -f $finalreport $finalreport.am
+       fi
+  fi
+
+  # remove temporary files in case of messy previous run
+  rm $diffmereport{,.compare,.diffs} $md5me_ir $finalreport 2>/dev/null
+}
+
+# generate the report on stat4
+getreport()
+{
+  SQL="SELECT log_host as Host,path as Path,chksum_new as New_Checksum, TIME(log_time) as Time,log_msg as Event
+   FROM log
+   WHERE log_ref IS NULL and entry_status != 'ACK' and entry_status != 'ACK_AUTO'
+   ORDER BY log_host,path LIMIT 2000;"
+
+  ssh $host "/usr/bin/mysql -usamhain --column-names --table -e \"${SQL}\" samhain" > $report
+
+  if [ `stat -c %s $report` -eq 0 ]
+  then echo Failed to get integrity report
+       exit 1
+  fi
+}
+
+# look into BSD checksum (sum -s) since it's ~80% faster on files >= 275M
+sshchecksum()
+{
+  sshto=$1
+  # if the file is part of the ignore list, skip it
+  if [ $(echo $filetocheck | grep -E "$ignorelist") -ne 0 ]
+  then break
+  fi
+  
+  # if file exists and if file is not a directory and if file is < 1GB, get its $checksum (most will meet this condition). 
+  # Otherwise, $checksum its directory path or let us know if it has been removed
+  check="ssh -q $sshto \"
+  if [ -e $filetocheck ]
+  then if [ ! -d $filetocheck ] 
+       then if [ $(du -h $filetocheck | cut -d\/ -f1 | grep -c G) -eq 0 ]
+            then $checksum $filetocheck | cut -d\ -f1
+            else largefile
+            fi
+       else echo $filetocheck | $checksum
+       fi
+  else echo removed 
+  fi
+  \""
+
+  # what to do?
+  case "$check" in
+          removed) # file was removed, that's all
+                   echo Removed: $filetocheck $sshto
+                ;;
+
+        largefile) # we *probably* don't care about files >= 1GB, and computing checksums would take forever
+                   echo Large_file: $(ssh -q $sshto "ls -l $filetocheck") $sshto >> $reporttmp/
+                ;;
+
+                *) # most conditions should end up here
+                   exists=$(grep $check $archive)
+                   if [ -n "$exists" ]                                                                                                            #  if the host's $checksum is in the archive
+                   then echo Archive_match: $check >> $diffmereport                                                                               #  then set to be acked and move on
+                   else for j in $(for i in $(locate $(basename $filetocheck) | grep -v '/.svn' | sort | uniq; do $checksum $i | cut -d\ -f1; done)) #  otherwise locate the file in the repos
+       	                do   if [ "$check" == "$j" ]                                                                                              #  if checksums match between the host and the repo
+       	   	                 then echo "$filetocheck $check" >> $archive                                                                          #  then add to archive 
+       	   	                      echo Archive_addition: $check
+       	   	                 else checkfileonhost $sshto                                                                                          #  otherwise go to the host and (diff the backup || cat the file)
+       	   	                 fi
+       	   	            done
+                   fi
+                ;;
+  esac
+}
+
+
+checkfileonhost()
+{
+    sshto=$1
+	ssh -q $sshto "
+    checksumfile=$($checksum $filetocheck | cut -d\ -f1)
+	for j in {0..9}
+    do  if [ -e /usr/local/backup/daily.\$j/localhost$filetocheck ] && [ \$(du -h $filetocheck | cut -d\/  -f1 | grep -c G) -eq 0 ] 
+        then if [ \"$checksumfile\" != \"$($checksum /usr/local/backup/daily.\$j/localhost$filetocheck | cut -d\ -f1) ]
+             then hostname -f && echo new vs old file permissions and diffs
+                  diff <(ls -l $filetocheck | awk '{print \$1,\$4}') <(ls -l /usr/local/backup/daily.\$j | awk '{print \$1,\$4}') | grep -v total | sort | uniq
+                  diff $filetocheck /usr/local/backup/daily.\$j/localhost$filetocheck | grep -E '>|<' | sed s/\>\ //g | sed s/\<\ //g 
+                  break
+             fi
+		else if [ \$j -eq 9 ] 
+		     then hostname -f && echo No backup on host for comparison of $filetocheck 
+		     fi
+        fi
+	done
+	" >> $diffmereport #| tee $diffmereport
+}
+
+
+
+# for each file
+filecheck()
+{
+for filetocheck in $(sed '1,/^$/d' "$report" | grep -v hosting | grep -E ".net|.com" | awk '{print $4}' | sort | uniq)
+do
+	# (optional $1) start from where you left off in a previous run
+	if [ -n "$checkpoint" ] 
+	then if [ "`echo $filetocheck $checkpoint | tr ' ' '\n' | sort | tail -1`" != "$checkpoint" ]
+	     then checkpoint=""
+	     else continue
+	     fi
+	fi
+
+    hosts=""        # reset the hosts
+    hosts_delimited=$(awk '{print $2,$4}' $report | grep -v hosting | grep "$filetocheck"$ | awk '{print $1}' | sort | uniq | tr '\n' ';') 
+
+    # check each host (if multiple) and see what the difference was
+    if [ $(echo $hosts_delimited | tr ';' '\n' | grep -v ^$ | wc -l) -le 1 ]
+    then # file only changed on one host. Get the differences from the backup, or if none exist, cat the file if it's small enough and text-based
+         echo -e $filetocheck " only changed on "$(echo $hosts_delimited | tr ';' '\n' | head -1)":\n" >> $finalreport
+         sshchecksum $(echo $hosts_delimited | tr ';' '\n' | head -1)
+         sshme $(echo $hosts_delimited | tr ';' '\n' | head -1)
+         grep -E "<|>|differences:" $diffmereport >> $finalreport
+    else # file changed on multiple hosts, check    
+	     echo -e "\n$filetocheck" >> $finalreport &&
+         for hoststocheck in $(echo $hosts_delimited | tr ';' '\n')
+	     do 
+	         echo -e "\n$hoststocheck" >> $finalreport && 
+	         ping -c1 -w1 $hoststocheck 1>/dev/null && 
+	         ssh -q $hoststocheck "test -e $filetocheck && test ! -d $filetocheck && $checksum $filetocheck | cut -f1 -d\  || echo 'DIRECTORY OR DOES NOT EXIST'" | tee -a $md5me_ir >> $finalreport &&
+	         hosts="$hosts $hoststocheck" || 
+	         echo "Cannot ping host!" >> $finalreport
+	     done
+		
+	     #echo -e "\n========= File =========\n$filetocheck"
+	     #echo -e "\n========= MD5s ========="
+	     result=`sort $md5me_ir | uniq | tr '\n' ';'`
+			
+	if [ `echo $result | tr ';' '\n' | grep -v "^$" | wc -l` -eq 1 ]
+	then echo Checksums match between hosts >> $finalreport
+	else #echo $result | tr ';' '\n' | grep -v "^$"
+	     for i in $hosts
+	     do  sshme $i #echo -e "\n$i\n" 
+	         if  [ ! -e $diffmereport.compare ]
+	         then cp -f $diffmereport $diffmereport.compare
+		     else diff $diffmereport.compare $diffmereport >> $diffmereport.diffs
+		     fi
+	     done
+	echo -e "\n\n=====UNIQUES=====\n\n" >> $finalreport
+	column -t $diffmereport.diffs | grep -E "<|>"  | sort | uniq >> $finalreport
+#| grep -v Checksums | sort | uniq >> $finalreport
+	 #read line
+	fi
+    fi
+    echo -e "\n\n\n\n\n\n=====================================" >> $finalreport
+    # remove temp files
+    rm $diffmereport{,.compare,.diffs} $md5me_ir 1>/dev/null 2>&1
+done
+}
+
+checksum
+filecheck
